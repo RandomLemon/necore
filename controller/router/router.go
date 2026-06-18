@@ -1,10 +1,15 @@
 package router
 
 import (
+	"fmt"
 	"necore/app"
 	"necore/controller/middleware"
+	"necore/dao"
 	"necore/service"
+	"necore/ws"
+	"strings"
 
+	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -37,7 +42,7 @@ func SetupRoutes() {
 	authGroup.Post("/register", middleware.AuthNeeded(), service.AddUser)
 	authGroup.Get("/user/:id", service.GetUserInfo)
 	authGroup.Get("/avatar/:id", service.GetUserAvatar)
-	authGroup.Get("/userlist", service.GetUserList)
+	authGroup.Get("/userlist", middleware.AuthNeeded(), service.GetUserList)
 	authGroup.Delete("/user/:id", middleware.AuthNeeded(), service.DeleteUser)
 	authGroup.Post("/password", middleware.AuthNeeded(), service.UpdateUserPassword)
 	authGroup.Post("/avatar", middleware.AuthNeeded(), service.UpdateUserAvatar)
@@ -73,4 +78,48 @@ func SetupRoutes() {
 	documentGroup.Post("/upload/:id", middleware.AuthNeeded(), service.UploadDocumentFile)
 	documentGroup.Delete("/upload/:id", middleware.AuthNeeded(), service.DeleteDocumentFile)
 	(*router).Static("/contents", "./contents")
+
+	botGroup := (*router).Group("/bots")
+
+	botGroup.Use("/ws/updates", func(c *fiber.Ctx) error {
+		if !websocket.IsWebSocketUpgrade(c) {
+			return fiber.ErrUpgradeRequired
+		}
+
+		auth := c.Get(fiber.HeaderAuthorization)
+		if !strings.HasPrefix(auth, "Bearer ") {
+			return c.SendStatus(fiber.StatusUnauthorized)
+		}
+
+		identifier := c.Params("identifier")
+		if identifier == "" {
+			return c.SendStatus(fiber.StatusBadRequest)
+		}
+
+		token := strings.TrimPrefix(auth, "Bearer ")
+		botToken, err := dao.GetBotTokenByPlainToken(token)
+		if err != nil {
+			ws.GlobalHub.AddLog(
+				fmt.Sprintf(
+					"⚠️ 拒绝 %s 连接：无效 Token",
+					identifier,
+				),
+				ws.ERROR,
+			)
+			return c.SendStatus(fiber.StatusUnauthorized)
+		}
+
+		c.Locals("token_id", botToken.ID)
+		c.Locals("token_name", botToken.Name)
+		c.Locals("identifier", identifier)
+		return c.Next()
+	})
+	botGroup.Get("/ws/updates", websocket.New(service.HandleWSConnection))
+
+	botGroup.Post("/token", middleware.AuthNeeded(), service.CreateBotToken)
+	botGroup.Get("/token", middleware.AuthNeeded(), service.GetBotTokenList)
+	botGroup.Get("/token/:id", middleware.AuthNeeded(), service.GetBotToken)
+	botGroup.Delete("/token/:id", middleware.AuthNeeded(), service.DeleteBotToken)
+	botGroup.Get("/status", middleware.AuthNeeded(), service.GetWSStatus)
+	botGroup.Delete("/ws/kick/:session_id", middleware.AuthNeeded(), service.KickConnection)
 }

@@ -17,6 +17,8 @@ var serverDatabase *gorm.DB
 
 var documentDatabase *gorm.DB
 
+var botTokenDatabase *gorm.DB
+
 func ConnectSqlite() {
 	var err error
 	userDatabase, err = gorm.Open(sqlite.Open("data/user.sqlite3"), &gorm.Config{})
@@ -43,6 +45,11 @@ func ConnectSqlite() {
 	}
 	documentDatabase.AutoMigrate(&model.DocumentNode{})
 
+	botTokenDatabase, err = gorm.Open(sqlite.Open("data/bot_connection.sqlite3"), &gorm.Config{})
+	if err != nil {
+		panic("failed to connect bot connection database")
+	}
+	botTokenDatabase.AutoMigrate(&model.BotToken{})
 }
 
 func GetUserDatabase() *gorm.DB {
@@ -59,4 +66,8 @@ func GetServerDatabase() *gorm.DB {
 
 func GetDocumentDatabase() *gorm.DB {
 	return documentDatabase
+}
+
+func GetBotTokenDatabase() *gorm.DB {
+	return botTokenDatabase
 }
