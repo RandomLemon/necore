@@ -3,21 +3,13 @@ package service
 import (
 	"encoding/json"
 	"necore/dao"
+	"necore/model"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 )
 
 func GetUserInfo(c *fiber.Ctx) error {
 	userId := c.Params("id")
-
-	// // Check if user is admin or himself
-	// token := c.Locals("user").(*jwt.Token)
-	// isAdmin := dao.IsUserInGroup(token, "admin")
-	// tokenUsername := dao.GetUsernameFromToken(token)
-	// if !isAdmin && tokenUsername != userId {
-	// 	return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Forbidden"})
-	// }
 
 	userModel, err := dao.GetUserByUsername(userId)
 	if err != nil || userModel == nil {
@@ -93,27 +85,33 @@ func GetUserList(c *fiber.Ctx) error {
 
 func DeleteUser(c *fiber.Ctx) error {
 	// Must be admin
-	token := c.Locals("user").(*jwt.Token)
-	if !dao.IsUserInGroup(token, "admin") {
+	user := c.Locals("currentUser").(model.User)
+	if !dao.ContainsGroup(user.Group, "admin") {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Forbidden"})
 	}
 
 	username := c.Params("id")
-	err := dao.DeleteUserByUsername(username)
+	err := dao.UpdateUserPermissions(username)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "Internal server error"})
 	}
+	err = dao.DeleteUserByUsername(username)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Internal server error"})
+	}
+
 	return c.SendStatus(200)
 }
 
 func UpdateUserPassword(c *fiber.Ctx) error {
-	token := c.Locals("user").(*jwt.Token)
-	isAdmin := dao.IsUserInGroup(token, "admin")
-	tokenUsername := dao.GetUsernameFromToken(token)
+	user := c.Locals("currentUser").(model.User)
+	isAdmin := dao.ContainsGroup(user.Group, "admin")
+	tokenUsername := user.Username
 
 	type Payload struct {
-		Id       string `json:"id"`
-		Password string `json:"new_password"`
+		Id          string `json:"id"`
+		OldPassword string `json:"self_password"`
+		NewPassword string `json:"new_password"`
 	}
 	payload := new(Payload)
 	if err := c.BodyParser(payload); err != nil {
@@ -125,7 +123,21 @@ func UpdateUserPassword(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Forbidden"})
 	}
 
-	if err := dao.UpdateUserPassword(payload.Id, payload.Password); err != nil {
+	userModel, err := dao.GetUserByUsername(payload.Id)
+
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal Server Error", "err": err})
+	}
+
+	if !dao.CheckUserPassword(payload.OldPassword, userModel.Password) {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid identity or password"})
+	}
+
+	if err := dao.UpdateUserPassword(payload.Id, payload.NewPassword); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
+	}
+
+	if err := dao.UpdateUserPermissions(payload.Id); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
 	}
 
@@ -135,8 +147,8 @@ func UpdateUserPassword(c *fiber.Ctx) error {
 
 func UpdateUserInfo(c *fiber.Ctx) error {
 	// Must be admin
-	token := c.Locals("user").(*jwt.Token)
-	if !dao.IsUserInGroup(token, "admin") {
+	user := c.Locals("currentUser").(model.User)
+	if !dao.ContainsGroup(user.Group, "admin") {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Forbidden"})
 	}
 	type PayloadTags struct {
@@ -166,6 +178,10 @@ func UpdateUserInfo(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
 	}
 
+	if err := dao.UpdateUserPermissions(payload.Username); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
+	}
+
 	return c.SendStatus(fiber.StatusOK)
 }
 
@@ -192,9 +208,9 @@ func UpdateUserAvatar(c *fiber.Ctx) error {
 	}
 
 	// Check if user is admin or himself
-	token := c.Locals("user").(*jwt.Token)
-	isAdmin := dao.IsUserInGroup(token, "admin")
-	tokenUsername := dao.GetUsernameFromToken(token)
+	user := c.Locals("currentUser").(model.User)
+	isAdmin := dao.ContainsGroup(user.Group, "admin")
+	tokenUsername := user.Username
 	if !(isAdmin || tokenUsername == payload.Username) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Forbidden"})
 	}

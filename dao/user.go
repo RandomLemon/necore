@@ -7,6 +7,7 @@ import (
 	"necore/config"
 	"necore/database"
 	"necore/model"
+	"slices"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -32,59 +33,33 @@ func DebugTestPassword() {
 	log.Println(`Test Password "test":`, hash)
 }
 
+func UnitTestPassword() string {
+	hash, _ := hashPassword("unit-test-password")
+	return hash
+}
+
 // Token
 
 func CreateToken(u model.User) (string, error) {
 	token := jwt.New(jwt.SigningMethodHS256)
 	claims := token.Claims.(jwt.MapClaims)
-	claims["username"] = u.Username
-	claims["group"] = u.Group
-	claims["tags"] = u.Tags
+
+	claims["name"] = u.Username
+	claims["ver"] = u.TokenVersion
+	claims["iat"] = time.Now().Unix()
 	claims["exp"] = time.Now().Add(time.Hour * 72).Unix()
+
 	t, err := token.SignedString([]byte(config.Config("SECRET")))
 	return t, err
 }
 
-func GetUsernameFromToken(t *jwt.Token) string {
-	return t.Claims.(jwt.MapClaims)["username"].(string)
-}
-
-func GetUserGroupsFromToken(t *jwt.Token) []string {
-	claims := t.Claims.(jwt.MapClaims)["group"]
-	if claims == nil {
-		return []string{}
-	}
-
+func ContainsGroup(userGroup string, group string) bool {
 	var groups []string
-	err := json.Unmarshal([]byte(claims.(string)), &groups)
+	err := json.Unmarshal([]byte(userGroup), &groups)
 	if err != nil {
-		return []string{}
+		groups = []string{}
 	}
-	return groups
-}
-
-func GetUserTagsFromToken(t *jwt.Token) []string {
-	claims := t.Claims.(jwt.MapClaims)["tags"]
-	if claims == nil {
-		return []string{}
-	}
-
-	var tags []string
-	err := json.Unmarshal([]byte(claims.(string)), &tags)
-	if err != nil {
-		return []string{}
-	}
-	return tags
-}
-
-func IsUserInGroup(t *jwt.Token, group string) bool {
-	groups := GetUserGroupsFromToken(t)
-	for _, g := range groups {
-		if g == group {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(groups, group)
 }
 
 // Database
@@ -145,6 +120,17 @@ func UpdateUserInfo(username string, group string, tags string) error {
 	var user *model.User
 	db.Where(&model.User{Username: username}).First(&user)
 	return db.Model(&user).Updates(model.User{Group: group, Tags: tags}).Error
+}
+
+func UpdateUserPermissions(username string) error {
+	db := database.GetUserDatabase()
+
+	return db.Model(&model.User{}).
+		Where(model.User{Username: username}).
+		UpdateColumn(
+			"token_version",
+			gorm.Expr("token_version + ?", 1),
+		).Error
 }
 
 func GetUserAvatar(username string) (string, error) {

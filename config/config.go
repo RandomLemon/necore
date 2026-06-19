@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"necore/util"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,11 +44,13 @@ func Init() error {
 		}
 
 		setDefaultEnvironment("PORT", "3000")
-		setDefaultEnvironment("BOT_LOG_BUFFER_SIZE", "100")
+		defaultSecret, _ := util.GenerateSecureToken("", 32)
+		setDefaultEnvironment("SECRET", defaultSecret)
+		setDefaultEnvironment("BOT_LOG_BUFFER_SIZE", "1000")
 
 		secret := strings.TrimSpace(os.Getenv("SECRET"))
-		if len(secret) < 32 {
-			initErr = fmt.Errorf("SECRET must contain at least 32 characters")
+		if len(secret) < 1 {
+			initErr = fmt.Errorf("SECRET must contain at least 1 characters, SECRET=%q", secret)
 		}
 	})
 

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -11,15 +12,18 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"necore/controller/middleware"
 	"necore/dao"
 	"necore/database"
 	"necore/model"
 	"necore/service"
+	"necore/ws"
 
 	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -83,33 +87,27 @@ func setupTestEnv(t *testing.T) *testEnv {
 		Model(&model.User{}).
 		Where("username = ?", "admin").
 		Updates(model.User{
-			Group:  `["admin","news_admin","server_admin","document_admin","bot_admin"]`,
-			Tags:   `[]`,
-			Avatar: "admin-avatar",
+			Password: dao.UnitTestPassword(),
+			Group:    `["admin","news_admin","server_admin","document_admin","bot_admin"]`,
+			Tags:     `[]`,
+			Avatar:   "admin-avatar",
 		}).Error)
 
 	must(t, database.GetUserDatabase().
 		Model(&model.User{}).
 		Where("username = ?", "alice").
 		Updates(model.User{
-			Group:  `[]`,
-			Tags:   `[]`,
-			Avatar: "alice-avatar",
+			Password: dao.UnitTestPassword(),
+			Group:    `[]`,
+			Tags:     `[]`,
+			Avatar:   "alice-avatar",
 		}).Error)
 
-	adminToken, err := dao.CreateToken(model.User{
-		Username: "admin",
-		Group:    `["admin","news_admin","server_admin","document_admin","bot_admin"]`,
-		Tags:     `[]`,
-	})
-	must(t, err)
-
-	userToken, err := dao.CreateToken(model.User{
-		Username: "alice",
-		Group:    `[]`,
-		Tags:     `[]`,
-	})
-	must(t, err)
+	// 从数据库重新读取用户后再签发 token。
+	// 引入 token_version 后，JWT 中的 ver 必须等于数据库里的 token_version，
+	// 不能再用手写的 model.User 字面量签发测试 token。
+	adminToken := createTokenForUser(t, "admin")
+	userToken := createTokenForUser(t, "alice")
 
 	app := fiber.New(fiber.Config{BodyLimit: 512 * 1024 * 1024})
 	registerRoutes(app)
@@ -146,17 +144,98 @@ func closeGormDB(t *testing.T, db *gorm.DB) {
 	}
 }
 
+func createTokenForUser(t *testing.T, username string) string {
+	t.Helper()
+
+	user, err := dao.GetUserByUsername(username)
+	must(t, err)
+	if user == nil {
+		t.Fatalf("user %q not found", username)
+	}
+
+	token, err := dao.CreateToken(*user)
+	must(t, err)
+	return token
+}
+
+func loginAndGetToken(t *testing.T, env *testEnv, username, password string) string {
+	t.Helper()
+
+	resp := doJSON(t, env, http.MethodPost, "/necore/auth/login", "", fiber.Map{
+		"username": username,
+		"password": password,
+	})
+	assertStatus(t, resp, http.StatusOK)
+
+	body := decodeBody(t, resp)
+	token, ok := body["token"].(string)
+	if !ok || token == "" {
+		t.Fatalf("login response should contain token string, got %#v", body)
+	}
+	return token
+}
+
+func getUserTokenVersion(t *testing.T, username string) uint {
+	t.Helper()
+
+	var version uint
+	result := database.GetUserDatabase().
+		Model(&model.User{}).
+		Select("token_version").
+		Where("username = ?", username).
+		Scan(&version)
+
+	must(t, result.Error)
+	if result.RowsAffected == 0 {
+		t.Fatalf("user %q not found while reading token_version", username)
+	}
+	return version
+}
+
+func incrementUserTokenVersion(t *testing.T, username string) {
+	t.Helper()
+
+	result := database.GetUserDatabase().
+		Model(&model.User{}).
+		Where("username = ?", username).
+		UpdateColumn("token_version", gorm.Expr("token_version + 1"))
+
+	must(t, result.Error)
+	if result.RowsAffected == 0 {
+		t.Fatalf("user %q not found while incrementing token_version", username)
+	}
+}
+
+func assertUserTokenVersion(t *testing.T, username string, want uint) {
+	t.Helper()
+
+	got := getUserTokenVersion(t, username)
+	if got != want {
+		t.Fatalf("token_version for %q = %d, want %d", username, got, want)
+	}
+}
+
 func registerRoutes(app *fiber.App) {
 	api := app.Group("/necore")
+
+	loginLimiter := limiter.New(limiter.Config{
+		Max:        8,
+		Expiration: time.Minute,
+		LimitReached: func(c *fiber.Ctx) error {
+			return c.Status(fiber.StatusTooManyRequests).
+				JSON(fiber.Map{"error": "Too many login attempts"})
+		},
+	})
+
 	api.Get("/slogan", service.SloganHandler)
 
 	authGroup := api.Group("/auth")
 	authGroup.Get("/status", middleware.AuthNeeded(), service.GetStatus)
-	authGroup.Post("/login", service.Login)
+	authGroup.Post("/login", loginLimiter, service.Login)
 	authGroup.Post("/register", middleware.AuthNeeded(), service.AddUser)
 	authGroup.Get("/user/:id", service.GetUserInfo)
 	authGroup.Get("/avatar/:id", service.GetUserAvatar)
-	authGroup.Get("/userlist", service.GetUserList)
+	authGroup.Get("/userlist", middleware.AuthNeeded(), service.GetUserList)
 	authGroup.Delete("/user/:id", middleware.AuthNeeded(), service.DeleteUser)
 	authGroup.Post("/password", middleware.AuthNeeded(), service.UpdateUserPassword)
 	authGroup.Post("/avatar", middleware.AuthNeeded(), service.UpdateUserAvatar)
@@ -194,12 +273,47 @@ func registerRoutes(app *fiber.App) {
 	api.Static("/contents", "./contents")
 
 	botGroup := api.Group("/bots")
+
+	botGroup.Use("/ws/updates", func(c *fiber.Ctx) error {
+		if !websocket.IsWebSocketUpgrade(c) {
+			return fiber.ErrUpgradeRequired
+		}
+
+		auth := c.Get(fiber.HeaderAuthorization)
+		if !strings.HasPrefix(auth, "Bearer ") {
+			return c.SendStatus(fiber.StatusUnauthorized)
+		}
+
+		identifier := c.Params("identifier")
+		if identifier == "" {
+			return c.SendStatus(fiber.StatusBadRequest)
+		}
+
+		token := strings.TrimPrefix(auth, "Bearer ")
+		botToken, err := dao.GetBotTokenByPlainToken(token)
+		if err != nil {
+			ws.GlobalHub.AddLog(
+				fmt.Sprintf(
+					"⚠️ 拒绝 %s 连接：无效 Token",
+					identifier,
+				),
+				ws.ERROR,
+			)
+			return c.SendStatus(fiber.StatusUnauthorized)
+		}
+
+		c.Locals("token_id", botToken.ID)
+		c.Locals("token_name", botToken.Name)
+		c.Locals("identifier", identifier)
+		return c.Next()
+	})
+	botGroup.Get("/ws/updates", websocket.New(service.HandleWSConnection))
+
 	botGroup.Post("/token", middleware.AuthNeeded(), service.CreateBotToken)
 	botGroup.Get("/token", middleware.AuthNeeded(), service.GetBotTokenList)
 	botGroup.Get("/token/:id", middleware.AuthNeeded(), service.GetBotToken)
 	botGroup.Delete("/token/:id", middleware.AuthNeeded(), service.DeleteBotToken)
 	botGroup.Get("/status", middleware.AuthNeeded(), service.GetWSStatus)
-	botGroup.Get("/ws/updates", websocket.New(service.HandleWSConnection))
 	botGroup.Delete("/ws/kick/:session_id", middleware.AuthNeeded(), service.KickConnection)
 }
 
@@ -303,7 +417,7 @@ func TestPublicAndAuthRoutes(t *testing.T) {
 
 	loginResp := doJSON(t, env, http.MethodPost, "/necore/auth/login", "", fiber.Map{
 		"username": "admin",
-		"password": "admin-pass",
+		"password": "unit-test-password",
 	})
 	assertStatus(t, loginResp, http.StatusOK)
 	loginBody := decodeBody(t, loginResp)
@@ -328,17 +442,24 @@ func TestPublicAndAuthRoutes(t *testing.T) {
 
 	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/user/admin", "", nil), http.StatusOK)
 	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/avatar/admin", "", nil), http.StatusOK)
-	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/userlist", "", nil), http.StatusOK)
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/userlist", "", nil), http.StatusUnauthorized)
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/userlist", env.adminToken, nil), http.StatusOK)
 
 	assertStatus(t, doJSON(t, env, http.MethodPost, "/necore/auth/password", env.userToken, fiber.Map{
-		"id":           "admin",
-		"new_password": "new",
+		"id":            "admin",
+		"self_password": "wrong-password",
+		"new_password":  "new",
 	}), http.StatusForbidden)
 
 	assertStatus(t, doJSON(t, env, http.MethodPost, "/necore/auth/password", env.userToken, fiber.Map{
-		"id":           "alice",
-		"new_password": "new",
+		"id":            "alice",
+		"self_password": "unit-test-password",
+		"new_password":  "new",
 	}), http.StatusOK)
+
+	// 改密码属于安全敏感操作。接入 token_version 后，alice 的旧 token
+	// 会立即失效，因此后续仍需要 alice 身份的断言必须重新登录获取新 token。
+	env.userToken = loginAndGetToken(t, env, "alice", "new")
 
 	assertStatus(t, doJSON(t, env, http.MethodPost, "/necore/auth/avatar", env.userToken, fiber.Map{
 		"username": "admin",
@@ -361,6 +482,8 @@ func TestPublicAndAuthRoutes(t *testing.T) {
 		"group":    []string{"document_admin"},
 		"Tags":     []any{},
 	}), http.StatusOK)
+
+	env.userToken = createTokenForUser(t, "alice")
 
 	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/auth/user/alice", env.userToken, nil), http.StatusForbidden)
 	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/auth/user/bob", env.adminToken, nil), http.StatusOK)
@@ -401,10 +524,12 @@ func TestNewsRoutes(t *testing.T) {
 	}), http.StatusOK)
 
 	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/news/detail/"+articleID, "", nil), http.StatusOK)
-	assertStatus(t, doMultipartFile(t, env, "/necore/news/upload/"+articleID, env.adminToken, "file", "hello.txt", "hello"), http.StatusOK)
+	response := doMultipartFile(t, env, "/necore/news/upload/"+articleID, env.adminToken, "file", "hello.txt", "hello")
+	assertStatus(t, response, http.StatusOK)
+	filename := strings.Split(decodeBody(t, response)["url"].(string), "/")[3]
 	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/news/upload/"+articleID, env.adminToken, fiber.Map{
-		"url": "/contents/" + articleID + "/hello.txt",
-	}), http.StatusOK)
+		"filename": filename,
+	}), http.StatusNoContent)
 	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/news/"+articleID, env.adminToken, nil), http.StatusOK)
 }
 
@@ -484,12 +609,14 @@ func TestDocumentRoutes(t *testing.T) {
 		"parentId": parentID,
 	}), http.StatusOK)
 
-	assertStatus(t, doMultipartFile(t, env, "/necore/documents/upload/"+nodeID, env.adminToken, "file", "doc.txt", "file body"), http.StatusOK)
+	response := doMultipartFile(t, env, "/necore/documents/upload/"+nodeID, env.adminToken, "file", "doc.txt", "file body")
+	assertStatus(t, response, http.StatusOK)
+	filename := strings.Split(decodeBody(t, response)["url"].(string), "/")[3]
 
 	// 不通过 Fiber Static 读取随后需要删除的同一个文件。
 	// Fiber/fasthttp 在 Windows 下可能让 SendFile 的文件句柄存活到请求上下文回收，
 	// 即使 net/http 响应体已读取并关闭，立即 os.Remove 仍可能得到 ERROR_SHARING_VIOLATION。
-	uploadedPath := filepath.Join(env.tmpDir, "contents", nodeID, "doc.txt")
+	uploadedPath := filepath.Join(env.tmpDir, "contents", nodeID, filename)
 	uploadedBody, err := os.ReadFile(uploadedPath)
 	must(t, err)
 	if string(uploadedBody) != "file body" {
@@ -497,8 +624,8 @@ func TestDocumentRoutes(t *testing.T) {
 	}
 
 	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/documents/upload/"+nodeID, env.adminToken, fiber.Map{
-		"url": "/contents/" + nodeID + "/doc.txt",
-	}), http.StatusOK)
+		"filename": filename,
+	}), http.StatusNoContent)
 	if _, err := os.Stat(uploadedPath); !os.IsNotExist(err) {
 		t.Fatalf("uploaded file should be deleted, stat err = %v", err)
 	}
@@ -515,7 +642,9 @@ func TestBotRoutes(t *testing.T) {
 	// Token 管理接口确实要求 bot_admin。
 	assertStatus(t, doJSON(t, env, http.MethodPost, "/necore/bots/token", env.userToken, nil), http.StatusForbidden)
 
-	createResp := doJSON(t, env, http.MethodPost, "/necore/bots/token", env.adminToken, nil)
+	createResp := doJSON(t, env, http.MethodPost, "/necore/bots/token", env.adminToken, fiber.Map{
+		"name": "unit-test",
+	})
 	assertStatus(t, createResp, http.StatusOK)
 	createBody := decodeBody(t, createResp)
 	tokenObj, ok := createBody["token"].(map[string]any)
@@ -528,7 +657,7 @@ func TestBotRoutes(t *testing.T) {
 
 	// 当前源码只要求“已登录”，没有 bot_admin 权限检查。
 	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/bots/status", env.userToken, nil), http.StatusOK)
-	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/bots/ws/kick/not-exist", env.userToken, nil), http.StatusOK)
+	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/bots/ws/kick/not-exist", env.userToken, nil), http.StatusForbidden)
 	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/bots/token/missing", env.adminToken, nil), http.StatusOK)
 }
 
@@ -539,11 +668,11 @@ func TestSecurityRegression_FileDeletePathTraversalIsCurrentlyPossible(t *testin
 	must(t, os.WriteFile(victim, []byte("do not delete"), 0o644))
 
 	resp := doJSON(t, env, http.MethodDelete, "/necore/documents/upload/anything", env.adminToken, fiber.Map{
-		"url": "victim.txt",
+		"filename": "../../victim.txt",
 	})
-	assertStatus(t, resp, http.StatusOK)
+	assertStatus(t, resp, http.StatusBadRequest)
 
-	if _, err := os.Stat(victim); !os.IsNotExist(err) {
+	if _, err := os.Stat(victim); err != nil {
 		t.Fatalf("expected vulnerable handler to delete arbitrary relative file; stat err = %v", err)
 	}
 }
@@ -553,16 +682,170 @@ func TestSecurityRegression_BotDashboardAvailableToAnyAuthenticatedUser(t *testi
 
 	// 该测试记录当前安全缺陷：普通登录用户也能查看 bot 状态并调用 kick。
 	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/bots/status", env.userToken, nil), http.StatusOK)
-	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/bots/ws/kick/arbitrary-session", env.userToken, nil), http.StatusOK)
+	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/bots/ws/kick/arbitrary-session", env.userToken, nil), http.StatusForbidden)
 }
 
 func TestSecurityRegression_PrivateUserDataIsPubliclyEnumerable(t *testing.T) {
 	env := setupTestEnv(t)
 
-	resp := doJSON(t, env, http.MethodGet, "/necore/auth/userlist", "", nil)
+	resp := doJSON(t, env, http.MethodGet, "/necore/auth/userlist", env.userToken, nil)
 	assertStatus(t, resp, http.StatusOK)
 
 	if !strings.Contains(string(resp.Body), "admin") || !strings.Contains(string(resp.Body), "alice") {
 		t.Fatalf("expected public user list to expose usernames, body=%s", string(resp.Body))
 	}
+}
+
+func TestTokenVersion_StaleTokenRejectedAcrossProtectedRouteGroups(t *testing.T) {
+	env := setupTestEnv(t)
+
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", env.adminToken, nil), http.StatusOK)
+
+	oldVersion := getUserTokenVersion(t, "admin")
+	incrementUserTokenVersion(t, "admin")
+	assertUserTokenVersion(t, "admin", oldVersion+1)
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   any
+	}{
+		{
+			name:   "auth status",
+			method: http.MethodGet,
+			path:   "/necore/auth/status",
+		},
+		{
+			name:   "auth register",
+			method: http.MethodPost,
+			path:   "/necore/auth/register",
+			body: fiber.Map{
+				"username": "stale-created-user",
+				"password": "password",
+			},
+		},
+		{
+			name:   "news create",
+			method: http.MethodPost,
+			path:   "/necore/news/create",
+		},
+		{
+			name:   "server create",
+			method: http.MethodGet,
+			path:   "/necore/server/create",
+		},
+		{
+			name:   "documents create node",
+			method: http.MethodPost,
+			path:   "/necore/documents/node",
+			body: fiber.Map{
+				"parentId": "root",
+				"isFolder": true,
+				"private":  false,
+				"name":     "Should Not Be Created",
+			},
+		},
+		{
+			name:   "bots status",
+			method: http.MethodGet,
+			path:   "/necore/bots/status",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := doJSON(t, env, tc.method, tc.path, env.adminToken, tc.body)
+			assertStatus(t, resp, http.StatusUnauthorized)
+		})
+	}
+
+	freshAdminToken := createTokenForUser(t, "admin")
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", freshAdminToken, nil), http.StatusOK)
+}
+
+func TestTokenVersion_PasswordChangeRevokesTargetUserToken(t *testing.T) {
+	env := setupTestEnv(t)
+
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", env.userToken, nil), http.StatusOK)
+
+	oldVersion := getUserTokenVersion(t, "alice")
+	assertStatus(t, doJSON(t, env, http.MethodPost, "/necore/auth/password", env.userToken, fiber.Map{
+		"id":            "alice",
+		"self_password": "unit-test-password",
+		"new_password":  "new-alice-password",
+	}), http.StatusOK)
+	assertUserTokenVersion(t, "alice", oldVersion+1)
+
+	// 旧 JWT 已经被撤销，不能再访问任何需要登录的接口。
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", env.userToken, nil), http.StatusUnauthorized)
+
+	// 旧密码不能登录，新密码登录后拿到的新 JWT 应该有效。
+	assertStatus(t, doJSON(t, env, http.MethodPost, "/necore/auth/login", "", fiber.Map{
+		"username": "alice",
+		"password": "alice-pass",
+	}), http.StatusUnauthorized)
+
+	newToken := loginAndGetToken(t, env, "alice", "new-alice-password")
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", newToken, nil), http.StatusOK)
+}
+
+func TestTokenVersion_UserPermissionChangeRevokesTargetTokenOnly(t *testing.T) {
+	env := setupTestEnv(t)
+
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", env.adminToken, nil), http.StatusOK)
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", env.userToken, nil), http.StatusOK)
+
+	oldAliceVersion := getUserTokenVersion(t, "alice")
+	oldAdminVersion := getUserTokenVersion(t, "admin")
+
+	assertStatus(t, doJSON(t, env, http.MethodPatch, "/necore/auth/user", env.adminToken, fiber.Map{
+		"username": "alice",
+		"group":    []string{"document_admin"},
+		"Tags":     []any{},
+	}), http.StatusOK)
+
+	assertUserTokenVersion(t, "alice", oldAliceVersion+1)
+	assertUserTokenVersion(t, "admin", oldAdminVersion)
+
+	// 被修改权限的目标用户旧 token 应该失效。
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", env.userToken, nil), http.StatusUnauthorized)
+
+	// 执行修改的管理员不应该因为修改别人权限而被迫下线。
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", env.adminToken, nil), http.StatusOK)
+
+	// 重新签发的新 token 应该携带/对应数据库中的最新权限。
+	freshAliceToken := createTokenForUser(t, "alice")
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/documents/layer/private/root", freshAliceToken, nil), http.StatusOK)
+}
+
+func TestTokenVersion_AvatarChangeDoesNotRevokeToken(t *testing.T) {
+	env := setupTestEnv(t)
+
+	oldVersion := getUserTokenVersion(t, "alice")
+	assertStatus(t, doJSON(t, env, http.MethodPost, "/necore/auth/avatar", env.userToken, fiber.Map{
+		"username": "alice",
+		"avatar":   "avatar-after-change",
+	}), http.StatusOK)
+
+	assertUserTokenVersion(t, "alice", oldVersion)
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", env.userToken, nil), http.StatusOK)
+}
+
+func TestTokenVersion_DeletedUserTokenIsRejected(t *testing.T) {
+	env := setupTestEnv(t)
+
+	assertStatus(t, doJSON(t, env, http.MethodPost, "/necore/auth/register", env.adminToken, fiber.Map{
+		"username": "charlie",
+		"password": "charlie-pass",
+	}), http.StatusOK)
+
+	charlieToken := loginAndGetToken(t, env, "charlie", "charlie-pass")
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", charlieToken, nil), http.StatusOK)
+
+	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/auth/user/charlie", env.adminToken, nil), http.StatusOK)
+
+	// 即使 token_version 没有递增，只要鉴权中间件每次查询数据库用户，
+	// 被删除用户的旧 JWT 也必须被拒绝。
+	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/auth/status", charlieToken, nil), http.StatusUnauthorized)
 }

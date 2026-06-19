@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
@@ -43,9 +42,9 @@ func generateStoredFilename(original string) (string, error) {
 
 func checkNewsPermission(c *fiber.Ctx) bool {
 	// Check if user is admin or news_admin
-	token := c.Locals("user").(*jwt.Token)
-	isAdmin := dao.IsUserInGroup(token, "admin")
-	isNewsAdmin := dao.IsUserInGroup(token, "news_admin")
+	user := c.Locals("currentUser").(model.User)
+	isAdmin := dao.ContainsGroup(user.Group, "admin")
+	isNewsAdmin := dao.ContainsGroup(user.Group, "news_admin")
 	if isAdmin || isNewsAdmin {
 		return false
 	}
@@ -74,8 +73,8 @@ func UpdateArticle(c *fiber.Ctx) error {
 	if checkNewsPermission(c) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Forbidden"})
 	}
-	token := c.Locals("user").(*jwt.Token)
-	author := dao.GetUsernameFromToken(token)
+	user := c.Locals("currentUser").(model.User)
+	author := user.Username
 
 	id := c.Params("id")
 	// Parse
@@ -244,7 +243,11 @@ func UploadArticleFile(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
 	}
-	if err := c.SaveFile(file, fmt.Sprintf("./contents/%s/%s", id, storedName)); err != nil {
+	contentPath, err := util.SafeContentPath("./contents", id, storedName)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+	}
+	if err := c.SaveFile(file, contentPath); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
 	}
 	return c.JSON(fiber.Map{"url": fmt.Sprintf("/contents/%s/%s", id, storedName)})

@@ -8,16 +8,15 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/millkhan/mcstatusgo/v2"
 )
 
 func checkServerPermission(c *fiber.Ctx) bool {
 	// Check if user is admin or news_admin
-	token := c.Locals("user").(*jwt.Token)
-	isAdmin := dao.IsUserInGroup(token, "admin")
-	isNewsAdmin := dao.IsUserInGroup(token, "server_admin")
+	user := c.Locals("currentUser").(model.User)
+	isAdmin := dao.ContainsGroup(user.Group, "admin")
+	isNewsAdmin := dao.ContainsGroup(user.Group, "server_admin")
 	if isAdmin || isNewsAdmin {
 		return false
 	}
@@ -57,7 +56,17 @@ func GetServerList(c *fiber.Ctx) error {
 	})
 }
 
+var statusSlots = make(chan struct{}, 16)
+
 func GetServerStatus(c *fiber.Ctx) error {
+	select {
+	case statusSlots <- struct{}{}:
+		defer func() { <-statusSlots }()
+	default:
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+			"error": "Service busy",
+		})
+	}
 	type Request struct {
 		ServerUrl string `json:"serverUrl"`
 	}

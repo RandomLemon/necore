@@ -10,15 +10,14 @@ import (
 	"os"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
 func checkDocumentPermission(c *fiber.Ctx) bool {
 	// Check if user is admin or document_admin
-	token := c.Locals("user").(*jwt.Token)
-	isAdmin := dao.IsUserInGroup(token, "admin")
-	isDocsAdmin := dao.IsUserInGroup(token, "document_admin")
+	user := c.Locals("currentUser").(model.User)
+	isAdmin := dao.ContainsGroup(user.Group, "admin")
+	isDocsAdmin := dao.ContainsGroup(user.Group, "document_admin")
 	if isAdmin || isDocsAdmin {
 		return true
 	}
@@ -46,8 +45,8 @@ func CreateDocumentNode(c *fiber.Ctx) error {
 	}
 	uuid := uuid.New().String()
 
-	token := c.Locals("user").(*jwt.Token)
-	username := dao.GetUsernameFromToken(token)
+	user := c.Locals("currentUser").(model.User)
+	username := user.Username
 	if err := dao.CreateDocumentNode(r.ParentId, r.IsFolder, r.Private, r.Name, uuid, username); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": err.Error(),
@@ -108,8 +107,8 @@ func UpdateDocumentNodeContent(c *fiber.Ctx) error {
 	}
 	id := c.Params("id")
 
-	token := c.Locals("user").(*jwt.Token)
-	username := dao.GetUsernameFromToken(token)
+	user := c.Locals("currentUser").(model.User)
+	username := user.Username
 
 	type contentRequest struct {
 		Type    string `json:"type"`
@@ -312,7 +311,11 @@ func UploadDocumentFile(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
 	}
-	if err := c.SaveFile(file, fmt.Sprintf("./contents/%s/%s", id, storedName)); err != nil {
+	contentPath, err := util.SafeContentPath("./contents", id, storedName)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+	}
+	if err := c.SaveFile(file, contentPath); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
 	}
 	return c.JSON(fiber.Map{"url": fmt.Sprintf("/contents/%s/%s", id, storedName)})

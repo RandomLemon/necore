@@ -8,9 +8,11 @@ import (
 	"necore/service"
 	"necore/ws"
 	"strings"
+	"time"
 
 	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 )
 
 type routerInstance struct {
@@ -33,12 +35,21 @@ func GetInstance() *routerInstance {
 }
 
 func SetupRoutes() {
+	loginLimiter := limiter.New(limiter.Config{
+		Max:        8,
+		Expiration: time.Minute,
+		LimitReached: func(c *fiber.Ctx) error {
+			return c.Status(fiber.StatusTooManyRequests).
+				JSON(fiber.Map{"error": "Too many login attempts"})
+		},
+	})
+
 	router := instance.Router
 	(*router).Get("/slogan", service.SloganHandler)
 
 	authGroup := (*router).Group("/auth")
 	authGroup.Get("/status", middleware.AuthNeeded(), service.GetStatus)
-	authGroup.Post("/login", service.Login)
+	authGroup.Post("/login", loginLimiter, service.Login)
 	authGroup.Post("/register", middleware.AuthNeeded(), service.AddUser)
 	authGroup.Get("/user/:id", service.GetUserInfo)
 	authGroup.Get("/avatar/:id", service.GetUserAvatar)

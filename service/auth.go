@@ -3,9 +3,9 @@ package service
 import (
 	"encoding/json"
 	"necore/dao"
+	"necore/model"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 )
 
 // Handlers
@@ -77,8 +77,8 @@ func Login(c *fiber.Ctx) error {
 // Register by admin
 func AddUser(c *fiber.Ctx) error {
 	// Check if user is admin
-	token := c.Locals("user").(*jwt.Token)
-	if !dao.IsUserInGroup(token, "admin") {
+	currentUser := c.Locals("currentUser").(model.User)
+	if !dao.ContainsGroup(currentUser.Group, "admin") {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Forbidden"})
 	}
 

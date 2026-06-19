@@ -2,14 +2,14 @@ package service
 
 import (
 	"necore/dao"
+	"necore/model"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 )
 
 func checkBotTokenPermission(c *fiber.Ctx) bool {
-	token := c.Locals("user").(*jwt.Token)
-	isBotAdmin := dao.IsUserInGroup(token, "bot_admin") || dao.IsUserInGroup(token, "admin")
+	user := c.Locals("currentUser").(model.User)
+	isBotAdmin := dao.ContainsGroup(user.Group, "bot_admin") || dao.ContainsGroup(user.Group, "admin")
 	if isBotAdmin {
 		return false
 	}

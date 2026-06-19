@@ -11,6 +11,9 @@ func AuthNeeded() fiber.Handler {
 	return jwtware.New(jwtware.Config{
 		SigningKey:   jwtware.SigningKey{Key: []byte(config.Config("SECRET"))},
 		ErrorHandler: jwtError,
+		SuccessHandler: func(c *fiber.Ctx) error {
+			return validateTokenVersion(c)
+		},
 	})
 }
 
