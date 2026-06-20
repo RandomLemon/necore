@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"necore/dao"
 	"necore/model"
+	"slices"
 
 	"github.com/gofiber/fiber/v2"
 )
@@ -178,8 +179,10 @@ func UpdateUserInfo(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
 	}
 
-	if err := dao.UpdateUserPermissions(payload.Username); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
+	if payload.Username != user.Username || !slices.Contains(payload.Group, "admin") {
+		if err := dao.UpdateUserPermissions(payload.Username); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
+		}
 	}
 
 	return c.SendStatus(fiber.StatusOK)
