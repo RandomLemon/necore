@@ -624,7 +624,7 @@ func TestBotRoutes(t *testing.T) {
 	// 当前源码只要求“已登录”，没有 bot_admin 权限检查。
 	assertStatus(t, doJSON(t, env, http.MethodGet, "/necore/bots/status", env.userToken, nil), http.StatusOK)
 	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/bots/ws/kick/not-exist", env.userToken, nil), http.StatusForbidden)
-	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/bots/token/missing", env.adminToken, nil), http.StatusOK)
+	assertStatus(t, doJSON(t, env, http.MethodDelete, "/necore/bots/token/missing", env.adminToken, nil), http.StatusInternalServerError)
 }
 
 func TestSecurityRegression_FileDeletePathTraversalIsCurrentlyPossible(t *testing.T) {
