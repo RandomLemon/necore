@@ -47,6 +47,7 @@ func Init() error {
 		defaultSecret, _ := util.GenerateSecureToken("", 32)
 		setDefaultEnvironment("SECRET", defaultSecret)
 		setDefaultEnvironment("BOT_LOG_BUFFER_SIZE", "1000")
+		setDefaultEnvironment("BOT_HEARTBEAT_TIMEOUT_SECONDS", "90")
 
 		secret := strings.TrimSpace(os.Getenv("SECRET"))
 		if len(secret) < 1 {

@@ -1,13 +1,9 @@
 package router
 
 import (
-	"fmt"
 	"necore/app"
 	"necore/controller/middleware"
-	"necore/dao"
 	"necore/service"
-	"necore/ws"
-	"strings"
 	"time"
 
 	"github.com/gofiber/contrib/websocket"
@@ -92,40 +88,8 @@ func SetupRoutes() {
 
 	botGroup := (*router).Group("/bots")
 
-	botGroup.Use("/ws/updates", func(c *fiber.Ctx) error {
-		if !websocket.IsWebSocketUpgrade(c) {
-			return fiber.ErrUpgradeRequired
-		}
-
-		auth := c.Get(fiber.HeaderAuthorization)
-		if !strings.HasPrefix(auth, "Bearer ") {
-			return c.SendStatus(fiber.StatusUnauthorized)
-		}
-
-		identifier := c.Params("identifier")
-		if identifier == "" {
-			return c.SendStatus(fiber.StatusBadRequest)
-		}
-
-		token := strings.TrimPrefix(auth, "Bearer ")
-		botToken, err := dao.GetBotTokenByPlainToken(token)
-		if err != nil {
-			ws.GlobalHub.AddLog(
-				fmt.Sprintf(
-					"⚠️ 拒绝 %s 连接：无效 Token",
-					identifier,
-				),
-				ws.ERROR,
-			)
-			return c.SendStatus(fiber.StatusUnauthorized)
-		}
-
-		c.Locals("token_id", botToken.ID)
-		c.Locals("token_name", botToken.Name)
-		c.Locals("identifier", identifier)
-		return c.Next()
-	})
-	botGroup.Get("/ws/updates", websocket.New(service.HandleWSConnection))
+	botGroup.Use("/ws/updates/:identifier", service.BotConectionChecker)
+	botGroup.Get("/ws/updates/:identifier", websocket.New(service.HandleWSConnection))
 
 	botGroup.Post("/token", middleware.AuthNeeded(), service.CreateBotToken)
 	botGroup.Get("/token", middleware.AuthNeeded(), service.GetBotTokenList)

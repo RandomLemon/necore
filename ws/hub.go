@@ -6,6 +6,7 @@ import (
 	"necore/config"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofiber/contrib/websocket"
@@ -43,20 +44,36 @@ func DBGLogMsg(text string) string {
 }
 
 type Client struct {
-	SessionID  string          `json:"session_id"`
-	Identifier string          `json:"identifier"`
-	TokenID    uint            `json:"token_id"`
-	TokenName  string          `json:"token_name"`
-	Connected  string          `json:"connected"`
-	Conn       *websocket.Conn `json:"-"`
+	SessionID         string          `json:"session_id"`
+	Identifier        string          `json:"identifier"`
+	TokenID           uint            `json:"token_id"`
+	TokenName         string          `json:"token_name"`
+	Connected         string          `json:"connected"`
+	LastHeartbeat     string          `json:"last_heartbeat"`
+	LastHeartbeatUnix int64           `json:"-"`
+	Conn              *websocket.Conn `json:"-"`
+}
+
+func (c *Client) TouchHeartbeat() {
+	atomic.StoreInt64(&c.LastHeartbeatUnix, time.Now().Unix())
+}
+
+func (c *Client) HeartbeatAge() time.Duration {
+	last := atomic.LoadInt64(&c.LastHeartbeatUnix)
+	if last == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(last, 0))
 }
 
 type Hub struct {
 	Clients map[string]*Client
 	mu      sync.RWMutex
 
-	Logs  []string
-	logMu sync.Mutex
+	Logs       []string
+	logMu      sync.Mutex
+	lastLogKey string
+	lastLogAt  time.Time
 }
 
 var GlobalHub = &Hub{
@@ -76,8 +93,27 @@ const (
 
 func (h *Hub) AddLog(msg string, level LogLevel) {
 	BOT_LOG_BUFFER_SIZE, _ := strconv.Atoi(config.Config("BOT_LOG_BUFFER_SIZE"))
+	if BOT_LOG_BUFFER_SIZE <= 0 {
+		BOT_LOG_BUFFER_SIZE = 1000
+	}
+
+	now := time.Now()
+
 	h.logMu.Lock()
 	defer h.logMu.Unlock()
+
+	logKey := fmt.Sprintf("%d|%s", level, msg)
+
+	// 5 分钟内，连续且完全相同的日志只记录一次。
+	// 注意：这里故意不在抑制时刷新 lastLogAt。
+	// 这样持续刷屏时，每 5 分钟最多重新出现一次，而不是永远不再出现。
+	if h.lastLogKey == logKey && now.Sub(h.lastLogAt) < 5*time.Minute {
+		return
+	}
+
+	h.lastLogKey = logKey
+	h.lastLogAt = now
+
 	logLevelStr := ""
 	switch level {
 	case DEBUG:
@@ -91,15 +127,18 @@ func (h *Hub) AddLog(msg string, level LogLevel) {
 	case SUCCESS:
 		logLevelStr = SUCLogMsg("SUC")
 	}
+
 	message := fmt.Sprintf(
 		"[%v] %s | %s",
-		time.Now().Format("2006-01-02 15:04:05"),
+		now.Format("2006-01-02 15:04:05"),
 		logLevelStr,
 		msg,
 	)
+
 	h.Logs = append(h.Logs, message)
+
 	if len(h.Logs) > BOT_LOG_BUFFER_SIZE {
-		h.Logs = h.Logs[:BOT_LOG_BUFFER_SIZE]
+		h.Logs = h.Logs[len(h.Logs)-BOT_LOG_BUFFER_SIZE:]
 	}
 }
 
@@ -174,6 +213,34 @@ func (h *Hub) Broadcast(message interface{}) {
 	}
 }
 
+func (h *Hub) BroadcastToSessions(message interface{}, sessionIDs []string) int {
+	if len(sessionIDs) == 0 {
+		return 0
+	}
+
+	targets := make(map[string]bool, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		targets[sessionID] = true
+	}
+
+	sent := 0
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	for sessionID, client := range h.Clients {
+		if !targets[sessionID] {
+			continue
+		}
+
+		if err := client.Conn.WriteJSON(message); err == nil {
+			sent++
+		}
+	}
+
+	return sent
+}
+
 // safeClientForDashboard returns a shallow copy whose display fields are safe
 // for HTML rendering. It keeps the JSON field names and types unchanged while
 // avoiding mutation of the internal Client object used by the WebSocket hub.
@@ -185,6 +252,12 @@ func safeClientForDashboard(c *Client) *Client {
 	copied := *c
 	copied.Identifier = escapeLogText(copied.Identifier)
 	copied.TokenName = escapeLogText(copied.TokenName)
+
+	last := atomic.LoadInt64(&c.LastHeartbeatUnix)
+	if last > 0 {
+		copied.LastHeartbeat = time.Unix(last, 0).Format("2006-01-02 15:04:05")
+	}
+
 	return &copied
 }
 

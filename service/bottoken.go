@@ -49,21 +49,30 @@ func CreateBotToken(c *fiber.Ctx) error {
 		})
 	}
 
-	if err := validateBotTokenName(r.Name); err != nil {
+	name := strings.TrimSpace(r.Name)
+
+	if err := validateBotTokenName(name); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": err.Error(),
 		})
 	}
 
-	token, err := dao.CreateBotToken(r.Name)
+	token, plainToken, err := dao.CreateBotToken(name)
 	if err != nil {
+		if errors.Is(err, dao.ErrBotTokenAlreadyExists) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": "Bot token name already exists",
+			})
+		}
+
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Internal server error",
 		})
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-		"token": token,
+		"token":       token,
+		"plain_token": plainToken,
 	})
 }
 

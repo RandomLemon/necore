@@ -91,10 +91,11 @@ func UpdateArticle(c *fiber.Ctx) error {
 		Content string `json:"content"`
 	}
 	type Payload struct {
-		Entity     PayloadEntity    `json:"entity"`
-		Content    []PayloadContent `json:"content"`
-		Category   string           `json:"category"`
-		DoesNotify bool             `json:"doesNotify"`
+		Entity           PayloadEntity    `json:"entity"`
+		Content          []PayloadContent `json:"content"`
+		Category         string           `json:"category"`
+		DoesNotify       bool             `json:"doesNotify"`
+		NotifySessionIDs []string         `json:"notifySessionIds"`
 	}
 	payload := new(Payload)
 	if err := c.BodyParser(payload); err != nil {
@@ -124,10 +125,16 @@ func UpdateArticle(c *fiber.Ctx) error {
 	}
 
 	if payload.DoesNotify {
-		go ws.GlobalHub.Broadcast(fiber.Map{
+		message := fiber.Map{
 			"event": "article_updated",
 			"data":  newArticle,
-		})
+		}
+
+		if len(payload.NotifySessionIDs) > 0 {
+			go ws.GlobalHub.BroadcastToSessions(message, payload.NotifySessionIDs)
+		} else {
+			go ws.GlobalHub.Broadcast(message)
+		}
 	}
 
 	return c.SendStatus(fiber.StatusOK)
