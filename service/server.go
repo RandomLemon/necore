@@ -76,13 +76,19 @@ func GetServerStatus(c *fiber.Ctx) error {
 			"error": err.Error(),
 		})
 	}
+	type Player struct {
+		Name string `json:"name"`
+		UUID string `json:"uuid"`
+	}
+
 	type Response struct {
-		Online      bool   `json:"online"`
-		Icon        string `json:"icon"`
-		PlayerCount int    `json:"playerCount"`
-		Capacity    int    `json:"capacity"`
-		Latency     int    `json:"latency"`
-		Version     string `json:"version"`
+		Online      bool     `json:"online"`
+		Icon        string   `json:"icon"`
+		PlayerCount int      `json:"playerCount"`
+		Capacity    int      `json:"capacity"`
+		Latency     int      `json:"latency"`
+		Version     string   `json:"version"`
+		Players     []Player `json:"players"`
 	}
 
 	results := strings.Split(req.ServerUrl, ":")
@@ -107,9 +113,26 @@ func GetServerStatus(c *fiber.Ctx) error {
 			Capacity:    0,
 			Latency:     0,
 			Version:     "",
+			Players:     []Player{},
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(res)
 	} else {
+		players := make([]Player, 0, len(status.Players.Sample))
+
+		for _, sample := range status.Players.Sample {
+			name := strings.TrimSpace(sample["name"])
+			uuid := strings.TrimSpace(sample["id"])
+
+			if name == "" {
+				continue
+			}
+
+			players = append(players, Player{
+				Name: name,
+				UUID: uuid,
+			})
+		}
+
 		res := Response{
 			Online:      true,
 			Icon:        status.Favicon,
@@ -117,6 +140,7 @@ func GetServerStatus(c *fiber.Ctx) error {
 			Capacity:    status.Players.Max,
 			Latency:     int(status.Latency.Milliseconds()),
 			Version:     status.Version.Name,
+			Players:     players,
 		}
 		return c.Status(fiber.StatusOK).JSON(res)
 	}
